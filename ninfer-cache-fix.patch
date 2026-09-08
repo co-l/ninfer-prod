@@ -1,0 +1,245 @@
+diff --git a/Dockerfile b/Dockerfile
+index bc3dc5d..503a90f 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -23,7 +23,7 @@ RUN cmake -S . -B /build -G Ninja \
+         -DNINFER_BUILD_APPS=ON \
+         -DBUILD_TESTING=OFF \
+         -DNINFER_BUILD_BENCHMARKS=OFF \
+-    && cmake --build /build --parallel --target ninfer ninfer-serve
++    && cmake --build /build --parallel 4 --target ninfer ninfer-serve
+ 
+ FROM nvidia/cuda:13.1.2-runtime-ubuntu24.04
+ 
+diff --git a/src/runtime/engine/materialization_planner.h b/src/runtime/engine/materialization_planner.h
+index 74e10a2..1cfe750 100644
+--- a/src/runtime/engine/materialization_planner.h
++++ b/src/runtime/engine/materialization_planner.h
+@@ -255,7 +255,7 @@ public:
+ 
+         const Clock::time_point search_started = Clock::now();
+         const std::uint64_t search_budget_ns =
+-            std::min<std::uint64_t>(5'000'000ULL, incumbent.cost.total_ns / 20U);
++            std::min<std::uint64_t>(5000000000ULL, incumbent.cost.total_ns / 20U);
+         const std::uint64_t guided_watchdog_ns = search_budget_ns;
+         std::uint64_t maximum_step_ns          = 0;
+         std::uint32_t optional_targets         = 0;
+@@ -570,6 +570,41 @@ public:
+         }
+ 
+         const std::uint64_t search_elapsed_ns = elapsed_ns(search_started, Clock::now());
++        {
++            const std::optional<PressureTargetHandle> graceful =
++                session.graceful_fallback_target(candidates[incumbent.candidate_index].id,
++                                                 preferred_owner_ids);
++                         (unsigned long long)candidates[incumbent.candidate_index].id.value,
++                         (int)stop_reason, graceful ? "yes" : "no");
++            if (graceful) {
++                AssessedPressureTarget assessed            = session.assess(*graceful);
++                const PressureTargetAssessment& assessment = assessed.assessment();
++                             (int)(assessment.candidate == candidates[incumbent.candidate_index].id),
++                             (int)(assessment.physical_status == MaterializationPhysicalStatus::Feasible),
++                             0, 0);
++                if (assessment.candidate == candidates[incumbent.candidate_index].id &&
++                    assessment.physical_status == MaterializationPhysicalStatus::Feasible) {
++                    const std::optional<LogicalGoal> goal =
++                        logical_goal(assessment.candidate, assessment.source_mode,
++                                     assessment.owner_outcomes);
++                    if (goal) {
++                        const FoldedCost cost =
++                            fold_assessment(candidates[incumbent.candidate_index], assessment,
++                                            pressure.owner_policy, pressure.checkpoint_policy,
++                                            machine_cost);
++                                     (int)cost.less(incumbent.cost),
++                                     (unsigned long long)cost.total_ns,
++                                     (unsigned long long)incumbent.cost.total_ns);
++                        if (cost.less(incumbent.cost)) {
++                            incumbent = make_incumbent(*graceful, incumbent.candidate_index,
++                                                       assessment, std::move(assessed), cost,
++                                                       *goal);
++                        }
++                    } else {
++                    }
++                }
++            }
++        }
+         if (!incumbent.assessed) {
+             AssessedPressureTarget assessed            = session.assess(incumbent.target);
+             const PressureTargetAssessment& assessment = assessed.assessment();
+@@ -624,9 +659,9 @@ public:
+     }
+ 
+ private:
+-    static constexpr std::uint32_t kTargetBudget           = 4096;
+-    static constexpr std::uint32_t kGuidedBeamWidth        = 16;
+-    static constexpr std::uint32_t kGuidedAssessmentBudget = 32;
++    static constexpr std::uint32_t kTargetBudget           = 262144;
++    static constexpr std::uint32_t kGuidedBeamWidth        = 64;
++    static constexpr std::uint32_t kGuidedAssessmentBudget = 256;
+ 
+     struct FoldedCost {
+         std::uint64_t now_ns                    = 0;
+diff --git a/src/targets/qwen3_6/export/ninfer/targets/qwen3_6/runtime.h b/src/targets/qwen3_6/export/ninfer/targets/qwen3_6/runtime.h
+index 4f66bff..ecf3fb3 100644
+--- a/src/targets/qwen3_6/export/ninfer/targets/qwen3_6/runtime.h
++++ b/src/targets/qwen3_6/export/ninfer/targets/qwen3_6/runtime.h
+@@ -552,6 +552,9 @@ public:
+     [[nodiscard]] std::optional<PressureTargetHandle>
+     guided_closure_target(runtime::PlanningCandidateId candidate,
+                           std::span<const runtime::PlanningOwnerId> preferred_owner_ids);
++    [[nodiscard]] std::optional<PressureTargetHandle>
++    graceful_fallback_target(runtime::PlanningCandidateId candidate,
++                             std::span<const runtime::PlanningOwnerId> preferred_owner_ids);
+     [[nodiscard]] runtime::PressureTargetGuidance guidance(PressureTargetHandle target);
+     [[nodiscard]] AssessedPressureTarget<Variant> assess(PressureTargetHandle target);
+     [[nodiscard]] PreparedPressureExpansion<Variant> prepare_expansion(PressureTargetHandle parent);
+diff --git a/src/targets/qwen3_6/impl/runtime/api_impl.h b/src/targets/qwen3_6/impl/runtime/api_impl.h
+index 8ecdd5d..513aa19 100644
+--- a/src/targets/qwen3_6/impl/runtime/api_impl.h
++++ b/src/targets/qwen3_6/impl/runtime/api_impl.h
+@@ -173,6 +173,14 @@ std::optional<PressureTargetHandle> PressurePlanningSession<Variant>::guided_clo
+     return impl_->guided_closure_target(candidate, preferred_owner_ids);
+ }
+ 
++template <>
++std::optional<PressureTargetHandle> PressurePlanningSession<Variant>::graceful_fallback_target(
++    runtime::PlanningCandidateId candidate,
++    std::span<const runtime::PlanningOwnerId> preferred_owner_ids) {
++    if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
++    return impl_->graceful_fallback_target(candidate, preferred_owner_ids);
++}
++
+ template <>
+ runtime::PressureTargetGuidance
+ PressurePlanningSession<Variant>::guidance(PressureTargetHandle target) {
+diff --git a/src/targets/qwen3_6/impl/runtime/pressure_planner.h b/src/targets/qwen3_6/impl/runtime/pressure_planner.h
+index 729c25a..65fc23e 100644
+--- a/src/targets/qwen3_6/impl/runtime/pressure_planner.h
++++ b/src/targets/qwen3_6/impl/runtime/pressure_planner.h
+@@ -146,7 +146,7 @@ namespace ninfer::targets::qwen3_6::detail {
+ 
+ namespace planning_detail {
+ 
+-inline constexpr std::size_t kOptionalTargetCapacity = 4096;
++inline constexpr std::size_t kOptionalTargetCapacity = 262144;
+ 
+ inline void hash_mix(std::uint64_t& hash, std::uint64_t value) noexcept {
+     hash ^= value;
+@@ -800,6 +800,103 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guided_closure_target(
+     return std::nullopt;
+ }
+ 
++inline std::optional<qwen3_6::PressureTargetHandle>
++PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::graceful_fallback_target(
++    runtime::PlanningCandidateId admission,
++    std::span<const runtime::PlanningOwnerId> preferred_owner_ids) {
++    if (scratch_live) { throw std::logic_error("pressure expansion scratch is still live"); }
++    const std::uint32_t selected_candidate = candidate_index(admission);
++    populate_options(selected_candidate);
++    CandidateOptions& options       = candidate_options[selected_candidate];
++    const CandidateState& candidate = *candidates[selected_candidate].state;
++
++    std::vector<std::size_t> victim_order;
++    victim_order.reserve(options.victims.size());
++    const auto append_victim = [&](std::size_t victim_index) {
++        if (std::find(victim_order.begin(), victim_order.end(), victim_index) ==
++            victim_order.end()) {
++            victim_order.push_back(victim_index);
++        }
++    };
++    for (const runtime::PlanningOwnerId id : preferred_owner_ids) {
++        const auto found =
++            std::find_if(options.victims.begin(), options.victims.end(), [&](const auto& victim) {
++                return victim.owner_index < owners.size() && owners[victim.owner_index].id == id;
++            });
++        if (found != options.victims.end()) {
++            append_victim(static_cast<std::size_t>(found - options.victims.begin()));
++        }
++    }
++    for (std::size_t index = 0; index < options.victims.size(); ++index) { append_victim(index); }
++
++    const auto projected_residual = [&](std::span<const std::uint16_t> target_choices) {
++        detail::PhysicalDelta pressure;
++        for (std::size_t index = 0; index < options.victims.size(); ++index) {
++            const std::uint16_t choice = target_choices[index];
++            if (choice == 0) { continue; }
++            if (choice > options.victims[index].decisions.size()) {
++                throw std::logic_error("graceful pressure choice is invalid");
++            }
++            const PressureDecision& decision = options.victims[index].decisions[choice - 1U];
++            pressure.added = NINFER_QWEN36_RUNTIME_NS::planning_resource_sum(
++                pressure.added, decision.effect.added);
++            pressure.removed = NINFER_QWEN36_RUNTIME_NS::planning_resource_sum(
++                pressure.removed, decision.effect.removed);
++        }
++        return program->guided_materialization_deficit(candidate, pressure);
++    };
++    const auto feasible = [&](std::span<const std::uint16_t> target_choices) {
++        return projected_residual(target_choices) == detail::PhysicalResources{};
++    };
++
++    choice_scratch.assign(options.victims.size(), 0);
++    for (std::size_t index = 0; index < options.victims.size(); ++index) {
++        choice_scratch[index] = options.victims[index].eviction_choice;
++    }
++
++    const auto choice_destructiveness = [&](std::size_t victim_index, std::uint16_t choice) {
++        std::uint64_t score = 0;
++        if (choice != 0) {
++            const PressureDecision& decision = options.victims[victim_index].decisions[choice - 1U];
++            score += decision.evicts_continuation ? 16ULL : 0ULL;
++            score += decision.checkpoint_drops;
++        }
++        return score;
++    };
++
++    for (auto it = victim_order.rbegin(); it != victim_order.rend(); ++it) {
++        const std::size_t victim_index = *it;
++        if (choice_scratch[victim_index] == 0) { continue; }
++        const std::vector<PressureDecision>& decisions = options.victims[victim_index].decisions;
++        std::uint16_t best_choice = choice_scratch[victim_index];
++        std::uint64_t best_score  = choice_destructiveness(victim_index, best_choice);
++        for (std::uint16_t choice = 0; choice <= decisions.size(); ++choice) {
++            if (choice == best_choice) { continue; }
++            choice_scratch[victim_index] = choice;
++            if (!feasible(choice_scratch)) { continue; }
++            const std::uint64_t score = choice_destructiveness(victim_index, choice);
++            if (score < best_score) {
++                best_score  = score;
++                best_choice = choice;
++            }
++        }
++        choice_scratch[victim_index] = best_choice;
++    }
++
++    TargetNode* existing = find_target(selected_candidate, choice_scratch);
++    const std::size_t maximum =
++        candidates.size() + 1U + planning_detail::kOptionalTargetCapacity;
++    if (existing == nullptr && targets.size() >= maximum) { return std::nullopt; }
++    const std::uint32_t target_index =
++        existing != nullptr ? static_cast<std::uint32_t>(existing - targets.data())
++                            : intern_target(selected_candidate, choice_scratch);
++    qwen3_6::PressureTargetHandle handle;
++    handle.session_    = this;
++    handle.generation_ = generation;
++    handle.index_      = target_index;
++    return handle;
++}
++
+ inline runtime::PressureTargetGuidance
+ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guidance(qwen3_6::PressureTargetHandle target) {
+     if (!valid(target) || scratch_live) {
+diff --git a/src/targets/qwen3_6/impl/runtime/program.h b/src/targets/qwen3_6/impl/runtime/program.h
+index 0ff969a..abadeb7 100644
+--- a/src/targets/qwen3_6/impl/runtime/program.h
++++ b/src/targets/qwen3_6/impl/runtime/program.h
+@@ -1326,6 +1326,9 @@ struct PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT> {
+     [[nodiscard]] std::optional<qwen3_6::PressureTargetHandle>
+     guided_closure_target(runtime::PlanningCandidateId candidate,
+                           std::span<const runtime::PlanningOwnerId> preferred_owner_ids);
++    [[nodiscard]] std::optional<qwen3_6::PressureTargetHandle>
++    graceful_fallback_target(runtime::PlanningCandidateId candidate,
++                             std::span<const runtime::PlanningOwnerId> preferred_owner_ids);
+     [[nodiscard]] runtime::PressureTargetGuidance guidance(qwen3_6::PressureTargetHandle target);
+     [[nodiscard]] qwen3_6::AssessedPressureTarget<NINFER_QWEN36_VARIANT>
+     assess(qwen3_6::PressureTargetHandle target);
