@@ -12,7 +12,7 @@ index bc3dc5d..503a90f 100644
  FROM nvidia/cuda:13.1.2-runtime-ubuntu24.04
  
 diff --git a/src/runtime/engine/materialization_planner.h b/src/runtime/engine/materialization_planner.h
-index 74e10a2..1cfe750 100644
+index 74e10a2..c615186 100644
 --- a/src/runtime/engine/materialization_planner.h
 +++ b/src/runtime/engine/materialization_planner.h
 @@ -255,7 +255,7 @@ public:
@@ -24,7 +24,7 @@ index 74e10a2..1cfe750 100644
          const std::uint64_t guided_watchdog_ns = search_budget_ns;
          std::uint64_t maximum_step_ns          = 0;
          std::uint32_t optional_targets         = 0;
-@@ -570,6 +570,41 @@ public:
+@@ -570,6 +570,32 @@ public:
          }
  
          const std::uint64_t search_elapsed_ns = elapsed_ns(search_started, Clock::now());
@@ -32,14 +32,9 @@ index 74e10a2..1cfe750 100644
 +            const std::optional<PressureTargetHandle> graceful =
 +                session.graceful_fallback_target(candidates[incumbent.candidate_index].id,
 +                                                 preferred_owner_ids);
-+                         (unsigned long long)candidates[incumbent.candidate_index].id.value,
-+                         (int)stop_reason, graceful ? "yes" : "no");
 +            if (graceful) {
 +                AssessedPressureTarget assessed            = session.assess(*graceful);
 +                const PressureTargetAssessment& assessment = assessed.assessment();
-+                             (int)(assessment.candidate == candidates[incumbent.candidate_index].id),
-+                             (int)(assessment.physical_status == MaterializationPhysicalStatus::Feasible),
-+                             0, 0);
 +                if (assessment.candidate == candidates[incumbent.candidate_index].id &&
 +                    assessment.physical_status == MaterializationPhysicalStatus::Feasible) {
 +                    const std::optional<LogicalGoal> goal =
@@ -50,15 +45,11 @@ index 74e10a2..1cfe750 100644
 +                            fold_assessment(candidates[incumbent.candidate_index], assessment,
 +                                            pressure.owner_policy, pressure.checkpoint_policy,
 +                                            machine_cost);
-+                                     (int)cost.less(incumbent.cost),
-+                                     (unsigned long long)cost.total_ns,
-+                                     (unsigned long long)incumbent.cost.total_ns);
 +                        if (cost.less(incumbent.cost)) {
 +                            incumbent = make_incumbent(*graceful, incumbent.candidate_index,
 +                                                       assessment, std::move(assessed), cost,
 +                                                       *goal);
 +                        }
-+                    } else {
 +                    }
 +                }
 +            }
@@ -66,7 +57,7 @@ index 74e10a2..1cfe750 100644
          if (!incumbent.assessed) {
              AssessedPressureTarget assessed            = session.assess(incumbent.target);
              const PressureTargetAssessment& assessment = assessed.assessment();
-@@ -624,9 +659,9 @@ public:
+@@ -624,9 +650,9 @@ public:
      }
  
  private:
