@@ -32,7 +32,7 @@ sudo podman run --name ninfer-serve --rm \
   --device-state-slots 4 \
   --host-state-slots 96 \
   --host-kv-mib 12288 \
-  --max-private-continuations 64 \
+  --max-private-continuations 128 \
   --max-shared-prefixes 64 \
   --request-log-jsonl /logs/requests.jsonl \
   --kv-dtype nvfp4 \

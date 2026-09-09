@@ -83,7 +83,7 @@ The reference launch flags, with rationale:
 --host-state-slots 96       # host state images (96 x ~144 MiB ≈ 13.8 GiB pinned)
 --device-state-slots 4      # 6 total device state images (C=2 + 4)
 --max-concurrency 2
---max-private-continuations 64
+--max-private-continuations 128   # >64: 65x8K working set needs >64 catalog slots
 --max-shared-prefixes 64
 --kv-dtype nvfp4 --spec mtp --draft-tokens 4 --lm-head-draft --vision
 ```
@@ -116,34 +116,32 @@ never forces an eviction when dropping a redundant state checkpoint suffices.
 - Deterministic and O(n log n); planning_elapsed stays in the single-digit ms
   range even at 200+ victims.
 
-## Known limitation — engine-level demote-execution data loss (open)
+## Known limitation — agent-sim host-restore reliability (open)
 
-Both validation benches (cache-pressure retention **and** agent-sim 4×150K)
-currently fall short because of an issue **below the planner**: after a
-demote-heavy plan executes, the demoted contexts lose fast reuse — re-queries
-show `cache 0%` / full re-prefill, and the cache drops from ~94 to ~10
-contexts in a single admission. The planner's plan says "keep 94, demote 4",
-but the executed cache does not retain the demoted contexts on the host tier
-for prefix/continuation reuse.
+**Retention bench (cache-pressure) now passes: 65/65 (108%), with the
+deterministic planner + `--max-private-continuations 128`.** The 64-slot
+catalog default evicts the oldest context under a 65×8K working set (each
+context takes endpoint + closure checkpoints), which capped retention at
+39/65; 128 slots + the planner's demote-only plans retain everything.
 
-This reproduces on every pressure-capable build (stock search, the previous
-graceful build, and this one), so it predates the planner rewrite and points
-at the pressure *execution* path (demote → host-tier store → restore on
-resume), not at the policy. Investigation notes:
+The **agent-sim 4×150K** is much improved but not yet 4/4: mains reuse ~96%
+across steps (6/8 of the largest 141K requests reuse 97-99%), yet ~2/4
+finalizes re-prefill in a clean run. The planner never drops (all plans
+`dropped=0`); the failures are **intermittent restore misses for demoted
+large contexts** under the concurrent working set (4×150K mains + 8×40K subs
+≈ 920K tokens vs the 12 GiB / ~651K-token host tier). The demote→host→restore
+path itself is sound (retention bench restores 8K contexts 65/65; 141K
+restores at ~11 s TTFT when they work). Suspects, in order:
 
-- Host arenas are allocated and pinned ("host state pinned 13.8 GiB", "host KV
-  pinned 12.0 GiB").
-- A single 8K context's host restore is well under the bench's 0.54 s hit
-  threshold, yet misses show full re-prefill timing — the KV is not found on
-  the host tier at all.
-- Suggested next step: instrument `publish_pressure_*` / the demote commit to
-  confirm the host copy is actually stored (and not released on the next
-  admission), then verify the host→device restore path is consulted for
-  prefix reuse on fresh requests, not only for active continuations.
+1. Host-tier capacity/eviction under the ~920K-token working set (12 GiB is
+   tight; 16 GiB exceeds the box's RAM once states are pinned).
+2. Restore races when several demotes/restores run concurrently (4 sessions).
+3. The planner demoting a session main when the shared-prefix catalog is full
+   mid-run, then the next step failing to bring it back.
 
-Until that is resolved, the deterministic planner is a strict improvement at
-the policy level (fast, deterministic, no nukes) but does not by itself make
-the two benches pass end-to-end.
+Next step: instrument the host→device restore path (and host-arena eviction)
+to see whether failed restores find a missing host copy (evicted) or abort
+under contention.
 
 ## Verify
 
