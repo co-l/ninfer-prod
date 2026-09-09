@@ -1,58 +1,63 @@
-# ninfer cache-fix — graceful context-swap fallback
+# ninfer cache-fix — deterministic value-ranked planner (sort, not search)
 
-A minimal patch to [ninfer](https://github.com/Neroued/ninfer) that makes concurrent
-**multi-session workloads with a RAM hot-KV tier** survive. Verified with
-`agent-sim` (cache-pressure) on an RTX 5090 (32 GiB VRAM, 30 GiB RAM):
-**4 concurrent 150K-token agent sessions, main contexts returned from RAM with
-zero re-prefill.**
+A patch to [ninfer](https://github.com/Neroued/ninfer) that replaces the
+bounded combinatorial *eviction search* in the materialization planner with a
+**deterministic, value-ranked assignment policy**. No search, no budget, no
+catastrophic fallback: every pressure decision is an O(n log n) sort of the
+cached contexts by value (hit count, shared credit, retention weight,
+recency), then a waterfall that assigns the highest-value contexts to the
+device pool, the next to the host tier (state + KV), and drops only what fits
+nowhere.
 
 ## The problem
 
-ninfer's materialization planner picks *where each incoming request's cached
-context lives*: on the GPU (device pool) or in the RAM hot-KV tier (offloaded
-via pinned host memory). The device pool is VRAM-bound (~440-500K tokens on a
-32 GiB card with a 27B model's weights resident), so at 4×150K one main
-context always lives in the RAM tier and **swaps back when its session
-resumes**.
+ninfer's materialization planner decides where each incoming request's cached
+context lives: GPU (device pool, ~440-500K tokens on a 32 GiB card with a 27B
+model resident) or the RAM hot-KV tier (pinned host memory). Under peak
+pressure (device and host simultaneously full) the stock planner's **bounded
+search** had three failure modes:
 
-When the swap requires freeing device space under peak pressure (device *and*
-host both full), the planner's **bounded search** can fail to find the
-demote-one-owner / restore-this-owner plan. Its fallback was catastrophic:
+1. **5 s search tax** — every pressure request ground the search budget to
+   prove a trivial plan (hydrates took 6 s TTFT).
+2. **Drop-1 churn** — when the device was over by more than one context's
+   worth, the greedy couldn't *chain* demotes, so it dropped one context per
+   admission (a sliding window; cache-pressure retention 1/65).
+3. **Root-maximal nuke** — the search's failure fallback released the ENTIRE
+   inactive cache (`selected_maximal_fallback`), collapsing every session's
+   prefixes.
 
-```cpp
-selected_maximal_fallback  // release the ENTIRE inactive cache
-```
+All three come from the same disease: *eviction as search*.
 
-— dropping every checkpoint (all sessions' prefixes) instead of evicting one
-low-value owner to RAM. Result: massive re-prefills and collapsed caches.
+## The fix: `deterministic_target` (sort, not search)
 
-## The fix (2 parts)
+New pressure-planner method that builds exactly one plan, deterministically:
 
-### 1. Graceful fallback plan (`graceful_fallback_target`)
+1. **Rank** every victim by value — `preferred_owner_ids` is already sorted by
+   `selected_hit_count`, shared credit, retention weight, recency (least
+   valuable first).
+2. **Phase 1 — device waterfall.** While the device is over-committed, demote
+   the lowest-value victims whose retained, non-evicting decision strictly
+   reduces device over-commitment. Demotes chain (several victims can be
+   demoted to close a deficit no single demote covers), and Host impact is
+   *deferred* — a momentarily full Host tier does not block a device fix.
+3. **Phase 2 — Host payoff.** While the plan (or Host) is still over-committed,
+   drop the state checkpoints of the lowest-value victims (the context's KV
+   stays cached, its prefix stays reusable) until the residual closes. This
+   pays the Host debt deferred by phase 1.
+4. **Phase 3 — evict.** Last resort: evict the lowest-value victims until the
+   plan is feasible (both tiers full, everything retainable retained).
 
-New pressure-planner method: start from the *drop-everything* plan (always
-feasible), then **greedily retain the most valuable victims** — keep on
-device when it fits, demote to the host tier when it doesn't — as long as the
-admission stays feasible. This always yields a minimal-damage plan.
+The engine seals the resulting plan directly — no queue, no beam, no guided
+closure, no budget, no fallback races. `deterministic_target` is always
+feasible-or-drops-to-minimum.
 
-The engine now builds this plan after every search and seals it whenever it
-beats the incumbent, so a failed search degrades gracefully instead of nuking
-the cache. (Runs even when the search succeeded — it only replaces the plan
-when strictly cheaper.)
+Supporting changes:
 
-### 2. Search budget that matches reality
-
-The materialization search space explodes combinatorially (per-victim eviction
-choices, not "12 contexts"), so the stock 5 ms budget could evaluate only a
-handful of targets at 4×150K scale:
-
-| Constant | stock | patched | why |
-|---|---|---|---|
-| search time cap | 5 ms | 5 s | budget = `min(cap, incumbent_cost/20)`; normal requests still stop early via value-of-next-expansion |
-| `kTargetBudget` | 4096 | 262144 | big-owner expansions fan out thousands of successors |
-| `kGuidedBeamWidth` | 16 | 64 | broader guided-closure coverage |
-| `kGuidedAssessmentBudget` | 32 | 256 | more closure candidates assessed |
-| `kOptionalTargetCapacity` | 4096 | 262144 | sizes the target arena (same fan-out reason) |
+- `kTargetBudget` / `kOptionalTargetCapacity` raised to 262144 (arena sizing
+  for big owner sets; the planner itself no longer searches).
+- The old `graceful_fallback_target` / `guided_closure_target` methods and the
+  expansion machinery are retained in the session API but no longer called by
+  the planner (dead code, kept to minimize the patch's surface).
 
 ## Build
 
@@ -68,7 +73,7 @@ sudo podman build -t ninfer:local .
 
 ## Serve configuration (`ninfer-serve.sh`)
 
-The reference launch flags that make 4×150K work, with rationale:
+The reference launch flags, with rationale:
 
 ```
 --kv-capacity 480000        # explicit device pool (auto picks ~440K; ~480K is the
@@ -94,44 +99,64 @@ The RAM footprint is dominated by **two pinned arenas**, not the weights
 
 - host **state**: 96 slots × ~144 MiB = **13.8 GiB** (per-continuation
   recurrent-state images — the Gated-DeltaNet state)
-- host **KV**: up to **12 GiB** (≈651K tokens at 18.4 KB/token)
+- host **KV**: up to **12 GiB** (≈651K tokens at ~18.4 KB/token)
 
-Sweep result: state slots below 96 or KV below ~10 GiB breaks finalize
-survival (4×150K needs ~380K tokens of RAM overflow + all concurrent states).
-A "20 GiB RAM" configuration is therefore **not achievable** for this
-workload; ~26-28 GiB is the practical floor. The one unused lever is the
-weights' ~21.5 GB page cache: `posix_fadvise(POSIX_FADV_DONTNEED)` after
-startup would reclaim it and make a cgroup limit viable.
+At 65×8K cached contexts each context carries an endpoint + rewrite state, so
+the state tier (device 6 + host 96 = 102 slots) is the binding constraint, not
+KV: the state waterfall (phase 2) exists precisely so a full Host state tier
+never forces an eviction when dropping a redundant state checkpoint suffices.
 
-## Results (agent-sim, 4 sessions × 150K main + 2×40K subs each, NVFP4 KV)
+## Planner-level behavior (verified on the RTX 5090 box)
 
-- Finalize survival (main context back from RAM after sub-agent work): **4/4**
-  in ~90% of runs (occasional 1-2 finalizes re-prefill when a peak-pressure
-  event drops a main — see "Known limitation").
-- Main-continuation reuse: 116/116 (100%) in clean runs.
-- Zero `selected_maximal_fallback` cache nukes.
-- Transfer baseline: RAM→VRAM restore ≈ **1.1 s for 123K tokens**
-  (~110K tok/s); VRAM→RAM demote is async and adds ~0 to the critical path.
-- Cold 123K prefill for reference: ~35 s.
+- Hydrate TTFT stays ~1.1 s (no 5 s search tax).
+- Steady-state retention-bench plans are `demoted=4 dropped=0` — chained
+  demotes instead of the old `demoted=1 dropped=1`.
+- Under 4×150K agent-sim load the planner emits `dropped=0` plans throughout
+  (up to 17 chained demotes at peak), zero `selected_maximal_fallback`.
+- Deterministic and O(n log n); planning_elapsed stays in the single-digit ms
+  range even at 200+ victims.
 
-## Known limitation
+## Known limitation — engine-level demote-execution data loss (open)
 
-At absolute peak (device + host simultaneously at capacity) a main can still
-be dropped instead of demoted, cascading into a re-prefill of that session's
-next turn and, occasionally, a finalize. The graceful fallback minimizes the
-damage but doesn't yet synthesize its own demote-to-host decisions — that's
-the next step (generate the demote decision in the fallback instead of relying
-on the search having populated it).
+Both validation benches (cache-pressure retention **and** agent-sim 4×150K)
+currently fall short because of an issue **below the planner**: after a
+demote-heavy plan executes, the demoted contexts lose fast reuse — re-queries
+show `cache 0%` / full re-prefill, and the cache drops from ~94 to ~10
+contexts in a single admission. The planner's plan says "keep 94, demote 4",
+but the executed cache does not retain the demoted contexts on the host tier
+for prefix/continuation reuse.
+
+This reproduces on every pressure-capable build (stock search, the previous
+graceful build, and this one), so it predates the planner rewrite and points
+at the pressure *execution* path (demote → host-tier store → restore on
+resume), not at the policy. Investigation notes:
+
+- Host arenas are allocated and pinned ("host state pinned 13.8 GiB", "host KV
+  pinned 12.0 GiB").
+- A single 8K context's host restore is well under the bench's 0.54 s hit
+  threshold, yet misses show full re-prefill timing — the KV is not found on
+  the host tier at all.
+- Suggested next step: instrument `publish_pressure_*` / the demote commit to
+  confirm the host copy is actually stored (and not released on the next
+  admission), then verify the host→device restore path is consulted for
+  prefix reuse on fresh requests, not only for active continuations.
+
+Until that is resolved, the deterministic planner is a strict improvement at
+the policy level (fast, deterministic, no nukes) but does not by itself make
+the two benches pass end-to-end.
 
 ## Verify
 
-Use `cache-pressure`'s `agent_sim` against the served endpoint:
+Use `cache-pressure`'s `agent_sim` and `cache_pressure` against the served
+endpoint:
 
 ```bash
 uv run python -m cache_pressure.agent_sim \
   --base-url http://<box>:8000/v1 --sessions 4 \
   --main-tokens 150000 --sub-tokens 40000 --sub-windows 2 \
   --ninfer-log <request-log>.jsonl
+
+uv run python -m cache_pressure --base-url http://<box>:8000/v1 --kv-size 480000
 ```
 
 Ground truth for reuse comes from ninfer's `--request-log-jsonl`
