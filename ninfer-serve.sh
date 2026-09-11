@@ -24,7 +24,7 @@ sudo podman run --name ninfer-serve --rm \
   --host 0.0.0.0 \
   --port 8000 \
   --model-id qwen3.8-27b \
-  --max-context 252928 \
+  --max-context 262144 \
   --kv-capacity 480000 \
   --max-concurrency 2 \
   --max-pending-requests 16 \
