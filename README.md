@@ -105,13 +105,14 @@ sudo podman build -t ninfer:local .
 The reference launch flags, with rationale:
 
 ```
---kv-capacity 480000        # explicit device pool (auto picks ~440K; ~480K is the
-                            # VRAM-safe max: 7904 page groups = 505,856 tokens is
-                            # 200 MB over budget on this box)
+--kv-capacity 460000        # explicit device pool at C=4 (measured hard limit
+                            # ~469K on the RTX 5090: 469,056 boots / 469,500 FATAL
+                            # 3 MB short; 460K keeps ~436 MiB VRAM margin vs
+                            # 268 MiB at the max pool)
 --host-kv-mib 12288         # 12 GiB pinned host-KV tier (see memory note)
 --host-state-slots 96       # host state images (96 x ~144 MiB ≈ 13.8 GiB pinned)
---device-state-slots 4      # 6 total device state images (C=2 + 4)
---max-concurrency 2
+--device-state-slots 4      # 8 total device state images (C=4 + 4)
+--max-concurrency 4
 --max-private-continuations 128   # >64: 65x8K working set needs >64 catalog slots
 --max-shared-prefixes 64
 --kv-dtype nvfp4 --spec mtp --draft-tokens 4 --lm-head-draft --vision

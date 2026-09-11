@@ -11,6 +11,8 @@ NINFER_DIR="${NINFER_DIR:-/home/your-user/ninfer}"
 MODELS_DIR="${MODELS_DIR:-$NINFER_DIR/models}"
 LOGS_DIR="${LOGS_DIR:-$NINFER_DIR/logs}"
 IMAGE="${IMAGE:-localhost/ninfer:local}"
+CONCURRENCY="${NINFER_CONCURRENCY:-4}"
+KV_CAPACITY="${NINFER_KV_CAPACITY:-460000}"
 
 cd "$NINFER_DIR"
 sudo podman run --name ninfer-serve --rm \
@@ -25,8 +27,8 @@ sudo podman run --name ninfer-serve --rm \
   --port 8000 \
   --model-id qwen3.8-27b \
   --max-context 262144 \
-  --kv-capacity 480000 \
-  --max-concurrency 2 \
+  --kv-capacity "$KV_CAPACITY" \
+  --max-concurrency "$CONCURRENCY" \
   --max-pending-requests 16 \
   --pending-timeout-ms 600000 \
   --device-state-slots 4 \
