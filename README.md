@@ -51,10 +51,39 @@ The engine seals the resulting plan directly — no queue, no beam, no guided
 closure, no budget, no fallback races. `deterministic_target` is always
 feasible-or-drops-to-minimum.
 
+### Host-feasibility is the allocator's answer, not the byte model
+
+The planner's internal byte model of the Host tier is optimistic in two ways
+the real extent allocator is not, and both caused the same failure (a plan
+declared feasible that compose's allocator then rejected → `blocked_host` →
+every candidate infeasible → maximal fallback → root re-prefill):
+
+1. **It credits Host frees the hot tier never releases.** Restores keep the
+   host copy (that is the RAM hot tier's point), so a "restore main, demote
+   others" plan cannot count the main's host pages as freed. The byte model
+   did; the allocator didn't (run 44: 2.79 GiB demote demand vs 2.48 GiB
+   free, planner residual host=0).
+2. **It is blind to the Host the plan itself frees by eviction.** An eviction
+   is deterministic (the victim's host extents are destroyed), unlike a
+   `DropHostDuplicate` which the hot tier may never materialize.
+
+`projected_residual` therefore asks the real allocator
+(`program->host_kv_requests_fit`, a conservative no-releases check of the
+current free extents) and accepts a plan when **either** the allocator fits
+**or** the plan's own evictions free enough Host to cover the demote demand
+(`added_host_kv <= host_free + host_freed_by_evictions`). When neither holds,
+the residual carries the true Host demand as pressure and Phase 3 converts
+demotes to evictions (same device relief, zero Host demand) instead of
+compose failing the whole plan. This is what makes the finalize of the
+last session survive at full occupancy: it evicts the already-finalized
+dead-weight mains instead of being blocked by a full Host tier.
+
 Supporting changes:
 
 - `kTargetBudget` / `kOptionalTargetCapacity` raised to 262144 (arena sizing
   for big owner sets; the planner itself no longer searches).
+- `ProgramImplCore::host_kv_requests_fit` — real-extent feasibility check
+  used by the planner (mirrors compose's Host admission, conservative).
 - The old `graceful_fallback_target` / `guided_closure_target` methods and the
   expansion machinery are retained in the session API but no longer called by
   the planner (dead code, kept to minimize the patch's surface).
@@ -116,37 +145,24 @@ never forces an eviction when dropping a redundant state checkpoint suffices.
 - Deterministic and O(n log n); planning_elapsed stays in the single-digit ms
   range even at 200+ victims.
 
-## Known limitation — agent-sim host-restore reliability (open)
+## Verified results (2026-09-11, clean production build)
 
-**Retention bench (cache-pressure) now passes: 65/65 (108%), with the
-deterministic planner + `--max-private-continuations 128`.** The 64-slot
-catalog default evicts the oldest context under a 65×8K working set (each
-context takes endpoint + closure checkpoints), which capped retention at
-39/65; 128 slots + the planner's demote-only plans retain everything.
+**Both benches pass on the same build, and agent-sim is stable across runs:**
 
-The **agent-sim 4×150K** is much improved but not yet 4/4: mains reuse ~96%
-across steps (6/8 of the largest 141K requests reuse 97-99%), yet ~2/4
-finalizes re-prefill in a clean run. The planner never drops (all plans
-`dropped=0`); the failures are **intermittent restore misses for demoted
-large contexts** under the concurrent working set (4×150K mains + 8×40K subs
-≈ 920K tokens vs the 12 GiB / ~651K-token host tier). The demote→host→restore
-path itself is sound (retention bench restores 8K contexts 65/65; 141K
-restores at ~11 s TTFT when they work). Suspects, in order:
-
-1. Host-tier capacity/eviction under the ~920K-token working set (12 GiB is
-   tight; 16 GiB exceeds the box's RAM once states are pinned).
-2. Restore races when several demotes/restores run concurrently (4 sessions).
-3. The planner demoting a session main when the shared-prefix catalog is full
-   mid-run, then the next step failing to bring it back.
-
-Next step: instrument the host→device restore path (and host-arena eviction)
-to see whether failed restores find a missing host copy (evicted) or abort
-under contention.
+- **cache-pressure retention: 65/65 (108.46%)** — hydrate TTFT ~1.1 s, all 65
+  contexts restorable from the RAM tier in reverse order.
+- **agent-sim 4×150K: 4/4 finalizes at ≥98.6% reuse** (`private_turn_closure`),
+  mains ~96.5% at every step (the natural 5K-token step growth), **zero
+  `selected_maximal_fallback`**, in 4 consecutive clean runs (46–48 + the
+  clean-build re-verify). The historical 2/4 coin-flip is gone: the finalize
+  of the last session now evicts the already-finalized dead-weight mains
+  (deterministic eviction frees) instead of being blocked by the full Host
+  tier and falling back to a root re-prefill.
 
 ## Verify
 
 Use `cache-pressure`'s `agent_sim` and `cache_pressure` against the served
-endpoint:
+endpoint (restart the server between benches — the caches accumulate):
 
 ```bash
 uv run python -m cache_pressure.agent_sim \

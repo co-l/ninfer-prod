@@ -11,11 +11,31 @@ index bc3dc5d..503a90f 100644
  
  FROM nvidia/cuda:13.1.2-runtime-ubuntu24.04
  
+diff --git a/src/core/host_kv_arena.cpp b/src/core/host_kv_arena.cpp
+index 4342574..a9fb939 100644
+--- a/src/core/host_kv_arena.cpp
++++ b/src/core/host_kv_arena.cpp
+@@ -3,6 +3,7 @@
+ #include "core/dtype.h"
+ 
+ #include <algorithm>
++#include <cstdio>
+ #include <exception>
+ #include <limits>
+ #include <stdexcept>
 diff --git a/src/runtime/engine/materialization_planner.h b/src/runtime/engine/materialization_planner.h
-index 74e10a2..109ffc1 100644
+index 74e10a2..785bbea 100644
 --- a/src/runtime/engine/materialization_planner.h
 +++ b/src/runtime/engine/materialization_planner.h
-@@ -226,6 +226,32 @@ public:
+@@ -7,6 +7,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <chrono>
++#include <cstdio>
+ #include <cstdint>
+ #include <limits>
+ #include <optional>
+@@ -226,6 +227,32 @@ public:
  
          Incumbent incumbent;
          std::uint32_t targets_evaluated = static_cast<std::uint32_t>(candidates.size());
@@ -48,7 +68,7 @@ index 74e10a2..109ffc1 100644
          if (identity_best) {
              incumbent        = std::move(*identity_best);
              incumbent.target = session.identity_target(candidates[incumbent.candidate_index].id);
-@@ -253,323 +279,42 @@ public:
+@@ -253,323 +280,44 @@ public:
              mark_target(assessment.stable_target_ordinal, kTargetDiscovered | kTargetAssessed);
          }
  
@@ -88,7 +108,12 @@ index 74e10a2..109ffc1 100644
 -            const PressureTargetGuidance guidance = session.guidance(entry.target);
 -            if (guidance.candidate != candidates[root.candidate_index].id) {
 -                throw std::logic_error("pressure guidance changed admission candidate");
--            }
++            const std::optional<PressureTargetHandle> deterministic =
++                session.deterministic_target(candidates[root.candidate_index].id,
++                                             preferred_owner_ids);
++            if (!deterministic) {
++                continue;
+             }
 -            guided_insert(GuidedEntry{
 -                .target          = entry.target,
 -                .candidate_index = root.candidate_index,
@@ -125,10 +150,6 @@ index 74e10a2..109ffc1 100644
 -            [&](PressureTargetHandle target, std::uint32_t expected_candidate,
 -                std::uint32_t expected_ordinal) -> std::optional<QueueEntry> {
 -            AssessedPressureTarget assessed            = session.assess(target);
-+            const std::optional<PressureTargetHandle> deterministic =
-+                session.deterministic_target(candidates[root.candidate_index].id,
-+                                             preferred_owner_ids);
-+            if (!deterministic) { continue; }
 +            AssessedPressureTarget assessed            = session.assess(*deterministic);
              const PressureTargetAssessment& assessment = assessed.assessment();
 -            if (assessment.candidate != candidates[expected_candidate].id ||
@@ -325,8 +346,8 @@ index 74e10a2..109ffc1 100644
 -            const Clock::time_point step_started = Clock::now();
 -            if (!expand_target(*exact)) { break; }
 -            maximum_step_ns = std::max(maximum_step_ns, elapsed_ns(step_started, Clock::now()));
--        }
--
+         }
+ 
 -        for (;;) {
 -            while (!queue_.empty() &&
 -                   target_marked(queue_.front().stable_target_ordinal, kTargetExpanded)) {
@@ -385,14 +406,14 @@ index 74e10a2..109ffc1 100644
 -                }
 -            }
 -            maximum_step_ns = std::max(maximum_step_ns, elapsed_ns(step_started, Clock::now()));
-         }
- 
+-        }
+-
 -        const std::uint64_t search_elapsed_ns = elapsed_ns(search_started, Clock::now());
 +        const std::uint64_t search_elapsed_ns = elapsed_ns(deterministic_started, Clock::now());
          if (!incumbent.assessed) {
              AssessedPressureTarget assessed            = session.assess(incumbent.target);
              const PressureTargetAssessment& assessment = assessed.assessment();
-@@ -624,9 +369,9 @@ public:
+@@ -624,9 +372,9 @@ public:
      }
  
  private:
@@ -405,6 +426,73 @@ index 74e10a2..109ffc1 100644
  
      struct FoldedCost {
          std::uint64_t now_ns                    = 0;
+@@ -647,7 +395,14 @@ private:
+         std::uint32_t target_ordinal            = 0;
+ 
+         [[nodiscard]] auto key() const noexcept {
++            // Reprocessing (re-prefill of already-processed context) is the hard rule to
++            // avoid: a context that has been processed must never be reprocessed unless
++            // eviction is truly unavoidable. Rank remaining prefill (text + vision) above
++            // the time estimate so a full host restore is always preferred over a cheaper
++            // partial re-prefill.
+             return std::tuple{
++                remaining_text_prefill,
++                remaining_vision_prefill,
+                 total_ns,
+                 affected_selected_hits,
+                 newest_affected_hit_epoch,
+@@ -655,8 +410,6 @@ private:
+                 checkpoint_drops,
+                 copy_operations,
+                 transferred_bytes,
+-                remaining_text_prefill,
+-                remaining_vision_prefill,
+                 std::numeric_limits<std::uint32_t>::max() - reused_prompt_tokens,
+                 current_session_binding ? 0U : 1U,
+                 candidate_ordinal,
+diff --git a/src/runtime/engine/resource_manager.h b/src/runtime/engine/resource_manager.h
+index f14837e..6a46552 100644
+--- a/src/runtime/engine/resource_manager.h
++++ b/src/runtime/engine/resource_manager.h
+@@ -5,8 +5,10 @@
+ #include "runtime/engine/context_cost.h"
+ #include "runtime/engine/materialization_planner.h"
+ #include "runtime/engine/shared_capture_planner.h"
++#include "targets/qwen3_6/export/ninfer/targets/qwen3_6/prepared_prompt.h"
+ 
+ #include <algorithm>
++#include <cstdio>
+ #include <array>
+ #include <bit>
+ #include <chrono>
+@@ -319,10 +321,14 @@ public:
+ 
+         if (cache_enabled_) {
+             for (const PrefixIndexEntry& index : prefix_index_) {
+-                if (!valid_prefix_index_entry(index)) { continue; }
++                if (!valid_prefix_index_entry(index)) {
++                    continue;
++                }
+                 const std::optional<PrefixShortlistKey> incoming =
+                     base.prefix_shortlist_key(index.key.frontier);
+-                if (!incoming || *incoming != index.key) { continue; }
++                if (!incoming || *incoming != index.key) {
++                    continue;
++                }
+ 
+                 if (!index.shared) {
+                     const CatalogEntry& entry = catalog_[index.slot];
+@@ -337,7 +343,9 @@ public:
+                     std::optional<AdmissionCandidate> plan =
+                         program.inspect_admission(prompt, base, *destination, &*entry.handle,
+                                                   nullptr, index.checkpoint, retain);
+-                    if (!plan) { continue; }
++                    if (!plan) {
++                        continue;
++                    }
+                     if (plan->summary().reusable_prompt_tokens == 0 ||
+                         (retain &&
+                          plan->identity_assessment().source_mode != PrivateSourceMode::Retain)) {
 diff --git a/src/targets/qwen3_6/export/ninfer/targets/qwen3_6/runtime.h b/src/targets/qwen3_6/export/ninfer/targets/qwen3_6/runtime.h
 index 4f66bff..2f85ed1 100644
 --- a/src/targets/qwen3_6/export/ninfer/targets/qwen3_6/runtime.h
@@ -449,11 +537,101 @@ index 8ecdd5d..a5b8d03 100644
  template <>
  runtime::PressureTargetGuidance
  PressurePlanningSession<Variant>::guidance(PressureTargetHandle target) {
+diff --git a/src/targets/qwen3_6/impl/runtime/host_kv_extent_store.h b/src/targets/qwen3_6/impl/runtime/host_kv_extent_store.h
+index d3a9098..a639efa 100644
+--- a/src/targets/qwen3_6/impl/runtime/host_kv_extent_store.h
++++ b/src/targets/qwen3_6/impl/runtime/host_kv_extent_store.h
+@@ -6,6 +6,7 @@
+ #include <algorithm>
+ #include <cstddef>
+ #include <cstdint>
++#include <cstdio>
+ #include <exception>
+ #include <limits>
+ #include <optional>
+@@ -91,16 +92,28 @@ public:
+     [[nodiscard]] std::optional<HostKVExtentReservation>
+     prepare(LogicalKVPageStore& pages, std::span<const LogicalKVPageHandle> membership) {
+         if (membership.empty() || free_count_ == 0 || membership.size() > free_membership_count_) {
++            std::fprintf(stderr,
++                         "[host] extent prepare FAIL count=%zu free=%zu mfree=%zu pages=%zu\n",
++                         occupied(), free_count_, free_membership_count_, membership.size());
+             return std::nullopt;
+         }
+         for (const LogicalKVPageHandle page : membership) {
+-            if (!pages.can_pin_source(page) || pages.host_resident(page)) { return std::nullopt; }
++            if (!pages.can_pin_source(page) || pages.host_resident(page)) {
++                std::fprintf(stderr, "[host] extent prepare FAIL pin/host-resident\n");
++                return std::nullopt;
++            }
+         }
+ 
+         const HostKVPageLayout& layout = page_layout(pages);
+         std::optional<HostKVAllocation> allocation =
+             arena_->allocate(layout, static_cast<std::uint32_t>(membership.size()));
+-        if (!allocation) { return std::nullopt; }
++        if (!allocation) {
++            std::fprintf(stderr,
++                         "[host] arena allocate FAIL pages=%zu occupied=%zu cap=%zu\n",
++                         membership.size(), arena_->occupied_bytes(),
++                         arena_->capacity_bytes());
++            return std::nullopt;
++        }
+ 
+         const std::uint32_t descriptor = free_[--free_count_];
+         Extent& extent                 = extents_[descriptor];
+@@ -337,13 +350,15 @@ public:
+             });
+             return true;
+         };
+-        for (const HostKVPageReplicaRelease& release : releases) {
++        for (std::size_t idx = 0; idx < releases.size(); ++idx) {
++            const HostKVPageReplicaRelease& release = releases[idx];
+             if (release.pages == nullptr || !mark_release(*release.pages, release.page, false) ||
+                 !append(release)) {
+                 return false;
+             }
+         }
+-        for (const HostKVPageReplicaRelease& release : last_reference_releases) {
++        for (std::size_t idx = 0; idx < last_reference_releases.size(); ++idx) {
++            const HostKVPageReplicaRelease& release = last_reference_releases[idx];
+             if (release.pages == nullptr || !mark_release(*release.pages, release.page, true) ||
+                 !append(release)) {
+                 return false;
+diff --git a/src/targets/qwen3_6/impl/runtime/prefix_identity.cpp b/src/targets/qwen3_6/impl/runtime/prefix_identity.cpp
+index bd916c7..7138304 100644
+--- a/src/targets/qwen3_6/impl/runtime/prefix_identity.cpp
++++ b/src/targets/qwen3_6/impl/runtime/prefix_identity.cpp
+@@ -410,10 +410,12 @@ std::array<std::uint64_t, 2> PrefixShortlistDigests::at(std::size_t frontier) co
+ bool prefix_matches(const PreparedPromptData& prompt, std::span<const TokenId> resident_tokens,
+                     const ResidentPrefixIdentity& resident_identity, std::size_t count) {
+     if (count > prompt.token_ids.size() || count > resident_tokens.size()) { return false; }
+-    return std::equal(prompt.token_ids.begin(),
+-                      prompt.token_ids.begin() + static_cast<std::ptrdiff_t>(count),
+-                      resident_tokens.begin()) &&
+-           resident_identity.matches(prompt, count);
++    const bool token_eq = std::equal(prompt.token_ids.begin(),
++                                     prompt.token_ids.begin() +
++                                         static_cast<std::ptrdiff_t>(count),
++                                     resident_tokens.begin());
++    const bool identity_eq = resident_identity.matches(prompt, count);
++    return token_eq && identity_eq;
+ }
+ 
+ } // namespace ninfer::targets::qwen3_6::detail
 diff --git a/src/targets/qwen3_6/impl/runtime/pressure_planner.h b/src/targets/qwen3_6/impl/runtime/pressure_planner.h
-index 729c25a..bc73739 100644
+index 729c25a..caba082 100644
 --- a/src/targets/qwen3_6/impl/runtime/pressure_planner.h
 +++ b/src/targets/qwen3_6/impl/runtime/pressure_planner.h
-@@ -146,7 +146,7 @@ namespace ninfer::targets::qwen3_6::detail {
+@@ -3,6 +3,7 @@
+ #include "targets/qwen3_6/impl/runtime/program.h"
+ 
+ #include <array>
++#include <cstdio>
+ #include <limits>
+ #include <tuple>
+ 
+@@ -146,7 +147,7 @@ namespace ninfer::targets::qwen3_6::detail {
  
  namespace planning_detail {
  
@@ -462,7 +640,7 @@ index 729c25a..bc73739 100644
  
  inline void hash_mix(std::uint64_t& hash, std::uint64_t value) noexcept {
      hash ^= value;
-@@ -800,6 +800,396 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guided_closure_target(
+@@ -800,6 +801,701 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guided_closure_target(
      return std::nullopt;
  }
  
@@ -625,6 +803,9 @@ index 729c25a..bc73739 100644
 +                                        std::optional<std::size_t> override_owner,
 +                                        const PressureDecision* override_decision) {
 +        detail::PhysicalDelta pressure;
++        std::vector<std::uint32_t> demote_main;
++        std::vector<std::uint32_t> demote_back;
++        std::uint64_t host_freed_by_evictions = 0;
 +        for (std::size_t index = 0; index < options.victims.size(); ++index) {
 +            const PressureDecision* decision = nullptr;
 +            if (override_owner && *override_owner == index) {
@@ -643,11 +824,74 @@ index 729c25a..bc73739 100644
 +                pressure.added, decision->effect.added);
 +            pressure.removed = NINFER_QWEN36_RUNTIME_NS::planning_resource_sum(
 +                pressure.removed, decision->effect.removed);
++            if (decision->evicts_continuation) {
++                host_freed_by_evictions += decision->effect.removed.host.kv_bytes;
++            }
++            for (const PressureKVDecision& kv : decision->main_kv_changes) {
++                if (kv.kind == PressureKVDecisionKind::DemoteToHost && kv.page_count != 0) {
++                    demote_main.push_back(kv.page_count);
++                }
++            }
++            for (const PressureKVDecision& kv : decision->backend_kv_changes) {
++                if (kv.kind == PressureKVDecisionKind::DemoteToHost && kv.page_count != 0) {
++                    demote_back.push_back(kv.page_count);
++                }
++            }
 +        }
 +        detail::PhysicalResources residual =
 +            program->guided_materialization_deficit(candidate, pressure);
-+        residual.host.kv_bytes =
-+            std::max(residual.host.kv_bytes, candidate.blocked_host_allocation_bytes);
++        // The plan's demotes add Host KV that compose_pressure_candidate must actually
++        // allocate in the Host extent arena, whose free space can be fragmented (the
++        // byte-total model above is optimistic). Ask the allocator: if the demote
++        // requests fit the current free extents, the byte model stands; otherwise the
++        // unpaid Host addition (demoted minus freed-by-DropHostDuplicate) becomes Host
++        // pressure so Phase 2 pays it by dropping Host duplicates of low-value shared
++        // prefixes — demote without eviction, reprocessing nothing.
++        const std::uint64_t added_host_kv = pressure.added.host.kv_bytes;
++        const std::uint64_t freed_host_kv = pressure.removed.host.kv_bytes;
++        // The admission's blocked bytes are all-or-nothing (the arena cannot serve the
++        // whole demote set as-is), but the tier still has free space. Charge only the
++        // true shortfall: requested minus the currently free Host bytes minus anything
++        // this plan already frees. Otherwise Phase 2 would over-evict (targeting the
++        // full demote instead of the few stale contexts that actually cover the gap).
++        const detail::PhysicalResources host_occupancy = program->physical_occupancy();
++        const std::uint64_t host_capacity_bytes =
++            program->admission_capacity().host.kv_bytes;
++        const std::uint64_t host_free_bytes =
++            host_capacity_bytes > host_occupancy.host.kv_bytes
++                ? host_capacity_bytes - host_occupancy.host.kv_bytes
++                : 0;
++        const std::uint64_t host_shortfall =
++            added_host_kv > freed_host_kv + host_free_bytes
++                ? added_host_kv - freed_host_kv - host_free_bytes
++                : 0;
++        // The byte model above over-credits Host frees the hot tier never lets go
++        // of (host copies are kept, so compose's real allocator can reject a demote
++        // set the model considers free — run 44: 2.79 GiB requested vs 2.48 GiB free,
++        // residual host=0). Ask the allocator directly: if the plan's demotes don't
++        // fit the current free extents, surface the true Host demand as pressure so
++        // Phase 3 converts demotes to evictions (zero Host demand) instead of
++        // compose failing the whole plan and falling back to a root re-prefill.
++        bool host_fits = true;
++        if (added_host_kv != 0) {
++            // The conservative allocator answer (no releases) is safe but blind to the
++            // Host this plan itself frees by eviction — and eviction frees ARE
++            // deterministic (the victim's Host extents are destroyed), unlike
++            // DropHostDuplicate which the hot tier may never materialize (run 44:
++            // rel=0/330). At high Host occupancy that blind spot wrongly blocks the
++            // eviction-based plan and the planner falls back to a partial reuse.
++            // Accept when the real allocator fits OR the plan's own evictions free
++            // enough Host to cover the demote demand.
++            const bool allocator_fits = program->host_kv_requests_fit(demote_main, demote_back);
++            const bool eviction_frees_cover =
++                added_host_kv <= host_free_bytes + host_freed_by_evictions;
++            host_fits = allocator_fits || eviction_frees_cover;
++        }
++        if (host_fits) {
++            residual.host.kv_bytes = std::max(residual.host.kv_bytes, host_shortfall);
++        } else {
++            residual.host.kv_bytes = std::max(residual.host.kv_bytes, added_host_kv);
++        }
 +        return residual;
 +    };
 +    const detail::PhysicalResources capacity = program->admission_capacity();
@@ -734,6 +978,218 @@ index 729c25a..bc73739 100644
 +    choice_scratch.assign(options.victims.size(), 0);
 +    const std::size_t maximum_steps =
 +        32U * std::max<std::size_t>(1, options.victims.size()) + 32U;
++    using PlanningContractAccess =
++        qwen3_6::detail::RuntimeContractAccess<NINFER_QWEN36_VARIANT>;
++    const auto owner_kv = [&](std::size_t victim_index)
++        -> std::pair<std::optional<KVAddressSpaceHandle>,
++                     std::optional<KVAddressSpaceHandle>> {
++        const Owner& owner = owners[options.victims[victim_index].owner_index];
++        if (owner.shared) {
++            const auto& s =
++                program->shared_prefix_states[PlanningContractAccess::index(*owner.shared_handle)];
++            if (!s.kv) { return {}; }
++            return {s.kv->text, s.kv->backend};
++        }
++        const auto& c =
++            program->continuation_states[PlanningContractAccess::index(*owner.private_handle)];
++        if (!c.kv) { return {}; }
++        return {c.kv->text, c.kv->backend};
++    };
++    // Page-disjointness guard: demote decisions must never target the same
++    // physical KV page twice within one plan. Nested same-session shared
++    // prefixes (and the shared system prefix) overlap, and the exact
++    // materialization check rejects duplicated page targets — which would
++    // otherwise collapse the whole deterministic plan and fall back to root.
++    std::vector<std::vector<std::uint32_t>> victim_pages(options.victims.size());
++    const auto collect_pages = [&](std::size_t victim_index,
++                                   const PressureDecision& decision,
++                                   std::vector<std::uint32_t>& text_targets,
++                                   std::vector<std::uint32_t>& back_targets) -> bool {
++        const auto [text_address, back_address] = owner_kv(victim_index);
++        const auto collect = [&](const auto& addresses, const auto& pages,
++                                 std::optional<KVAddressSpaceHandle> address,
++                                 const std::vector<PressureKVDecision>& changes,
++                                 std::vector<std::uint32_t>& out) -> bool {
++            if (changes.empty()) { return true; }
++            if (!address || !addresses || !pages) { return false; }
++            const std::uint32_t mapped = addresses->mapped_pages(*address);
++            for (const PressureKVDecision& action : changes) {
++                if (action.kind == PressureKVDecisionKind::None) { continue; }
++                if (action.begin_page > mapped ||
++                    action.page_count > mapped - action.begin_page) {
++                    return false;
++                }
++                for (std::uint32_t offset = 0; offset < action.page_count; ++offset) {
++                    out.push_back(pages->descriptor_index(
++                        addresses->logical_page(*address, action.begin_page + offset)));
++                }
++            }
++            return true;
++        };
++        return collect(program->text_kv_addresses, program->text_kv_pages, text_address,
++                       decision.main_kv_changes, text_targets) &&
++               collect(program->backend_kv_addresses, program->backend_kv_pages, back_address,
++                       decision.backend_kv_changes, back_targets);
++    };
++    const auto overlaps_committed = [&](std::size_t victim_index,
++                                        const PressureDecision& decision) -> bool {
++        std::vector<std::uint32_t> text_targets;
++        std::vector<std::uint32_t> back_targets;
++        if (!collect_pages(victim_index, decision, text_targets, back_targets)) { return true; }
++        const auto overlaps = [&](const std::vector<std::uint32_t>& candidate,
++                                  const std::vector<std::uint32_t>& committed) {
++            for (const std::uint32_t page : candidate) {
++                if (std::find(committed.begin(), committed.end(), page) != committed.end()) {
++                    return true;
++                }
++            }
++            return false;
++        };
++        for (std::size_t other = 0; other < options.victims.size(); ++other) {
++            if (other == victim_index) { continue; }
++            const bool text_overlap  = overlaps(text_targets, victim_pages[other]);
++            const bool back_overlap  = overlaps(back_targets, victim_pages[other]);
++            if (text_overlap || back_overlap) {
++                return true;
++            }
++        }
++        return false;
++    };
++    const auto commit_pages = [&](std::size_t victim_index, const PressureDecision& decision) {
++        std::vector<std::uint32_t> text_targets;
++        std::vector<std::uint32_t> back_targets;
++        if (!collect_pages(victim_index, decision, text_targets, back_targets)) {
++            throw std::logic_error("deterministic page guard cannot resolve target pages");
++        }
++        std::vector<std::uint32_t>& own = victim_pages[victim_index];
++        own.clear();
++        for (const std::uint32_t page : text_targets) {
++            if (std::find(own.begin(), own.end(), page) == own.end()) { own.push_back(page); }
++        }
++        for (const std::uint32_t page : back_targets) {
++            if (std::find(own.begin(), own.end(), page) == own.end()) { own.push_back(page); }
++        }
++    };
++
++
++    // Trim a demote/device-drop decision to its exclusive pages: drop pages already
++    // committed by other victims (shared prefixes / nested contexts). A whole-tree
++    // demote (main + shared prefix) would otherwise be rejected by the page guard
++    // and the victim would fall through to eviction — the exact bug that made the
++    // planner mass-evict mains at the ~130K working-set point.
++    const auto trim_to_exclusive = [&](std::size_t victim_index,
++                                       const PressureDecision& decision)
++        -> std::optional<PressureDecision> {
++        std::vector<std::uint32_t> committed;
++        for (std::size_t other = 0; other < options.victims.size(); ++other) {
++            if (other == victim_index) { continue; }
++            committed.insert(committed.end(), victim_pages[other].begin(),
++                             victim_pages[other].end());
++        }
++        std::sort(committed.begin(), committed.end());
++        committed.erase(std::unique(committed.begin(), committed.end()), committed.end());
++
++        const auto [text_addr, back_addr] = owner_kv(victim_index);
++
++        PressureDecision out = decision;
++        out.main_kv_changes.clear();
++        out.backend_kv_changes.clear();
++        out.transfer_requirements.clear();
++        out.effect = detail::PhysicalDelta{};
++        // State/checkpoint contributions are untouched by the trim.
++        out.effect.removed.device.state_slots = decision.effect.removed.device.state_slots;
++        out.effect.added.host.state_slots     = decision.effect.added.host.state_slots;
++        out.effect.removed.host.state_slots   = decision.effect.removed.host.state_slots;
++        out.effect.added.device.state_slots   = decision.effect.added.device.state_slots;
++        out.checkpoint_drop_effect            = decision.checkpoint_drop_effect;
++
++        const auto trim_store = [&](const auto& addresses, const auto& pages,
++                                    std::optional<KVAddressSpaceHandle> address,
++                                    const std::vector<PressureKVDecision>& changes,
++                                    std::vector<PressureKVDecision>& out_changes,
++                                    runtime::ContextResourceClass resource) {
++            if (!address || !addresses || !pages) { return; }
++            const HostKVPageLayout layout =
++                plan_host_kv_page_layout(pages->physical_pool().geometry());
++            const std::uint32_t mapped = addresses->mapped_pages(*address);
++            const bool backend =
++                resource == runtime::ContextResourceClass::BackendKV;
++            const auto emit = [&](PressureKVDecision action) {
++                const std::uint64_t bytes =
++                    layout.page_stride * static_cast<std::uint64_t>(action.page_count);
++                if (action.kind == PressureKVDecisionKind::DemoteToHost) {
++                    if (backend) {
++                        out.effect.removed.device.backend_kv_pages += action.page_count;
++                    } else {
++                        out.effect.removed.device.main_kv_pages += action.page_count;
++                    }
++                    out.effect.added.host.kv_bytes += bytes;
++                    std::vector<DeviceKVPageHandle> physical;
++                    physical.reserve(action.page_count);
++                    for (std::uint32_t off = 0; off < action.page_count; ++off) {
++                        physical.push_back(pages->physical(
++                            addresses->logical_page(*address, action.begin_page + off)));
++                    }
++                    const std::uint32_t runs =
++                        pages->physical_pool().contiguous_run_count(physical);
++                    const TransferWork work =
++                        plan_host_kv_transfer_work(layout, action.page_count, runs);
++                    out.transfer_requirements.push_back(runtime::ContextTransferRequirement{
++                        .resource   = resource,
++                        .direction  = runtime::ContextTransferDirection::DeviceToHost,
++                        .units      = work.payload_bytes,
++                        .page_count = action.page_count,
++                        .work       = work,
++                    });
++                } else if (action.kind ==
++                           PressureKVDecisionKind::DropDeviceDuplicate) {
++                    if (backend) {
++                        out.effect.removed.device.backend_kv_pages += action.page_count;
++                    } else {
++                        out.effect.removed.device.main_kv_pages += action.page_count;
++                    }
++                } else if (action.kind == PressureKVDecisionKind::DropHostDuplicate) {
++                    out.effect.removed.host.kv_bytes += bytes;
++                }
++                out_changes.push_back(action);
++            };
++            for (const PressureKVDecision& action : changes) {
++                if (action.kind == PressureKVDecisionKind::None || action.page_count == 0) {
++                    continue;
++                }
++                std::uint32_t run_begin = action.begin_page;
++                const std::uint32_t end = action.begin_page + action.page_count;
++                for (std::uint32_t p = action.begin_page; p < end; ++p) {
++                    const LogicalKVPageHandle logical =
++                        addresses->logical_page(*address, p);
++                    const bool taken = std::binary_search(
++                        committed.begin(), committed.end(), pages->descriptor_index(logical));
++                    if (taken) {
++                        if (p > run_begin) {
++                            emit({.begin_page = run_begin, .page_count = p - run_begin,
++                                  .kind = action.kind});
++                        }
++                        run_begin = p + 1;
++                    }
++                }
++                if (end > run_begin) {
++                    emit({.begin_page = run_begin, .page_count = end - run_begin,
++                          .kind = action.kind});
++                }
++            }
++        };
++        trim_store(program->text_kv_addresses, program->text_kv_pages, text_addr,
++                   decision.main_kv_changes, out.main_kv_changes,
++                   runtime::ContextResourceClass::MainKV);
++        trim_store(program->backend_kv_addresses, program->backend_kv_pages, back_addr,
++                   decision.backend_kv_changes, out.backend_kv_changes,
++                   runtime::ContextResourceClass::BackendKV);
++        if (out.main_kv_changes.empty() && out.backend_kv_changes.empty() &&
++            out.state_changes.empty() && out.dropped_checkpoints.empty()) {
++            return std::nullopt;
++        }
++        return out;
++    };
 +
 +    // Phase 1 — device waterfall: while the device is over-committed, demote the
 +    // lowest-value victims whose retained (non-evicting, no-new-checkpoint-drop)
@@ -757,12 +1213,24 @@ index 729c25a..bc73739 100644
 +                const std::uint32_t prior_drops =
 +                    current == nullptr ? 0 : current->checkpoint_drops;
 +                if (candidate.checkpoint_drops > prior_drops) { continue; }
++                const PressureDecision* effective = &candidate;
++                PressureDecision trimmed;
++                if (overlaps_committed(victim_index, candidate)) {
++                    std::optional<PressureDecision> t =
++                        trim_to_exclusive(victim_index, candidate);
++                    if (!t || (t->main_kv_changes.empty() && t->backend_kv_changes.empty() &&
++                               t->state_changes.empty())) {
++                        continue;
++                    }
++                    trimmed = std::move(*t);
++                    effective = &trimmed;
++                }
 +                const detail::PhysicalResources child =
-+                    projected_residual(choice_scratch, victim_index, &candidate);
++                    projected_residual(choice_scratch, victim_index, effective);
 +                if (device_key(child) >= device_key(residual)) { continue; }
 +                selected = Selection{
 +                    .victim_index = victim_index,
-+                    .decision     = candidate,
++                    .decision     = *effective,
 +                    .residual     = child,
 +                };
 +                break;
@@ -771,6 +1239,7 @@ index 729c25a..bc73739 100644
 +        }
 +        if (!selected) { break; }
 +        choice_scratch[selected->victim_index] = intern_selection(*selected);
++        commit_pages(selected->victim_index, selected->decision);
 +    }
 +
 +    // Phase 2 — Host payoff: while Host (or the whole plan) is still over-committed,
@@ -792,10 +1261,23 @@ index 729c25a..bc73739 100644
 +            refresh_options(victim, residual, current);
 +            for (std::uint16_t choice = 1; choice <= victim.decisions.size(); ++choice) {
 +                const PressureDecision& candidate = victim.decisions[choice - 1U];
-+                if (candidate.evicts_continuation) { continue; }
 +                const std::uint32_t prior_drops =
 +                    current == nullptr ? 0 : current->checkpoint_drops;
-+                if (candidate.checkpoint_drops <= prior_drops) { continue; }
++                if (candidate.evicts_continuation) {
++                    // Host-relief eviction: relieve a full Host tier (and the device
++                    // over-commitment) by evicting the lowest-value victim whose eviction
++                    // frees Host bytes. Private victims only — the shared system prefix
++                    // and live mains' shared base must survive (their pages are not
++                    // exclusive to this owner anyway). Never undo a phase 1 demote.
++                    if (candidate.effect.removed.host.kv_bytes == 0) { continue; }
++                    if (current != nullptr && !current->evicts_continuation) { continue; }
++                    if (owners[options.victims[victim_index].owner_index].shared) { continue; }
++                } else {
++                    const bool adds_drops    = candidate.checkpoint_drops > prior_drops;
++                    const bool frees_host_kv = candidate.effect.removed.host.kv_bytes != 0;
++                    if (!adds_drops && !frees_host_kv) { continue; }
++                    if (overlaps_committed(victim_index, candidate)) { continue; }
++                }
 +                const detail::PhysicalResources child =
 +                    projected_residual(choice_scratch, victim_index, &candidate);
 +                if (!(residual_key(child) < residual_key(residual))) { continue; }
@@ -810,6 +1292,7 @@ index 729c25a..bc73739 100644
 +        }
 +        if (!selected) { break; }
 +        choice_scratch[selected->victim_index] = intern_selection(*selected);
++        commit_pages(selected->victim_index, selected->decision);
 +    }
 +
 +    // Phase 3 — evict: last resort. While still infeasible, evict the lowest-value
@@ -860,10 +1343,19 @@ index 729c25a..bc73739 100644
  PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guidance(qwen3_6::PressureTargetHandle target) {
      if (!valid(target) || scratch_live) {
 diff --git a/src/targets/qwen3_6/impl/runtime/program.h b/src/targets/qwen3_6/impl/runtime/program.h
-index 0ff969a..336a1e7 100644
+index 0ff969a..2f86c33 100644
 --- a/src/targets/qwen3_6/impl/runtime/program.h
 +++ b/src/targets/qwen3_6/impl/runtime/program.h
-@@ -1326,6 +1326,12 @@ struct PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT> {
+@@ -1071,6 +1071,8 @@ private:
+     [[nodiscard]] detail::PhysicalResources
+     guided_materialization_deficit(const ResourceCandidateState& candidate,
+                                    const detail::PhysicalDelta& pressure) const;
++    [[nodiscard]] bool host_kv_requests_fit(std::span<const std::uint32_t> main_pages,
++                                            std::span<const std::uint32_t> back_pages) const;
+     [[nodiscard]] bool
+     protected_materialization_page(const MaterializationSourceProtection* protection,
+                                    const KVAddressSpaceStore& addresses, std::uint32_t page_offset,
+@@ -1326,6 +1328,12 @@ struct PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT> {
      [[nodiscard]] std::optional<qwen3_6::PressureTargetHandle>
      guided_closure_target(runtime::PlanningCandidateId candidate,
                            std::span<const runtime::PlanningOwnerId> preferred_owner_ids);
@@ -876,3 +1368,142 @@ index 0ff969a..336a1e7 100644
      [[nodiscard]] runtime::PressureTargetGuidance guidance(qwen3_6::PressureTargetHandle target);
      [[nodiscard]] qwen3_6::AssessedPressureTarget<NINFER_QWEN36_VARIANT>
      assess(qwen3_6::PressureTargetHandle target);
+diff --git a/src/targets/qwen3_6/impl/runtime/program_impl.h b/src/targets/qwen3_6/impl/runtime/program_impl.h
+index 9ef417b..66132e4 100644
+--- a/src/targets/qwen3_6/impl/runtime/program_impl.h
++++ b/src/targets/qwen3_6/impl/runtime/program_impl.h
+@@ -17,6 +17,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <chrono>
++#include <cstdio>
+ #include <exception>
+ #include <iterator>
+ #include <limits>
+@@ -1292,7 +1293,9 @@ ProgramImplCore::materialization_source_protection(const ResourceCandidateState&
+             return std::nullopt;
+         }
+         const SequenceState& source = continuation_states[admission.source_index];
+-        if (!source.kv) { return std::nullopt; }
++        if (!source.kv) {
++            return std::nullopt;
++        }
+         kv                              = &*source.kv;
+         protection.private_source_index = admission.source_index;
+         protection.state = selected_state(source, admission.reuse, admission.selected_checkpoint);
+@@ -2159,7 +2162,9 @@ bool ProgramImplCore::pressure_checkpoint_recovery_impacts(
+ 
+     for (std::size_t index = 0; index < private_owners.size(); ++index) {
+         const ContinuationHandle* handle = private_owners[index];
+-        if (handle == nullptr || !valid_continuation(*handle)) { return false; }
++        if (handle == nullptr || !valid_continuation(*handle)) {
++            return false;
++        }
+         const SequenceState& sequence = continuation_states[ContractAccess::index(*handle)];
+         projected_owners.push_back(OwnerProjection{
+             .sequence = &sequence,
+@@ -3505,10 +3510,9 @@ std::optional<detail::PressureTargetProjection> ProgramImplCore::evaluate_pressu
+         const std::size_t stride =
+             plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
+         for (const PressureSelectedPage& item : selected) {
+-            if (pages.address_references(item.page) != item.references ||
+-                pages.writer_references(item.page) != 0 || pages.source_pins(item.page) != 0) {
+-                continue;
+-            }
++            if (pages.source_pins(item.page) != 0) { continue; }
++            if (pages.writer_references(item.page) != 0) { continue; }
++            if (pages.address_references(item.page) != item.references) { continue; }
+             const PressurePageScratchSlot* projected = find_pressure_page_scratch(pages, item.page);
+             const bool device_resident               = projected != nullptr && projected->projected
+                                                            ? projected->device
+@@ -3658,7 +3662,9 @@ bool ProgramImplCore::compose_pressure_candidate(
+                       planning_owner) != details.pressure_owner_ids.end()) {
+             throw std::invalid_argument("materialization pressure owner is invalid");
+         }
+-        if (!valid_continuation(*owner)) { return false; }
++        if (!valid_continuation(*owner)) {
++            return false;
++        }
+         const std::uint32_t index      = ContractAccess::index(*owner);
+         const std::uint64_t generation = ContractAccess::epoch(*owner);
+         if ((details.has_source && index == details.source_index &&
+@@ -3684,7 +3690,9 @@ bool ProgramImplCore::compose_pressure_candidate(
+         pressure_needs_transfer =
+             pressure_needs_transfer || !expected.transfer_requirements.empty();
+         const SequenceState& pressure_owner = continuation_states[index];
+-        if (!pressure_owner.kv) { return false; }
++        if (!pressure_owner.kv) {
++            return false;
++        }
+         append_kv_actions(*text_kv_addresses, *text_kv_pages, pressure_owner.kv->text,
+                           expected.main_kv_changes, private_host_requests);
+         if (!expected.backend_kv_changes.empty()) {
+@@ -3713,7 +3721,9 @@ bool ProgramImplCore::compose_pressure_candidate(
+                       planning_owner) != details.shared_pressure_owner_ids.end()) {
+             throw std::invalid_argument("materialization shared pressure owner is invalid");
+         }
+-        if (!valid_shared_prefix(*owner)) { return false; }
++        if (!valid_shared_prefix(*owner)) {
++            return false;
++        }
+         const std::uint32_t index      = ContractAccess::index(*owner);
+         const std::uint64_t generation = ContractAccess::epoch(*owner);
+         if ((details.has_shared_source && index == details.shared_source_index &&
+@@ -3741,7 +3751,9 @@ bool ProgramImplCore::compose_pressure_candidate(
+         pressure_needs_transfer =
+             pressure_needs_transfer || !expected.transfer_requirements.empty();
+         const SharedPrefixState& pressure_owner = shared_prefix_states[index];
+-        if (!pressure_owner.kv) { return false; }
++        if (!pressure_owner.kv) {
++            return false;
++        }
+         append_kv_actions(*text_kv_addresses, *text_kv_pages, pressure_owner.kv->text,
+                           expected.main_kv_changes, shared_host_requests);
+         if (!expected.backend_kv_changes.empty()) {
+@@ -3756,7 +3768,9 @@ bool ProgramImplCore::compose_pressure_candidate(
+     const std::optional<detail::PressureTargetProjection> projection = evaluate_pressure_target(
+         &*protection, pressure_owners, details.pressure_options, shared_pressure_owners,
+         details.shared_pressure_options, &host_last_reference_releases);
+-    if (!projection) { return false; }
++    if (!projection) {
++        return false;
++    }
+     const detail::PhysicalResources& removed = projection->unique_object_delta.removed;
+     const detail::PhysicalResources& added   = projection->unique_object_delta.added;
+ 
+@@ -6826,6 +6840,35 @@ ProgramImplCore::guided_materialization_deficit(const ResourceCandidateState& ad
+     return positive_resource_difference(required, admission_capacity());
+ }
+ 
++// Mirrors compose_pressure_candidate's Host extent admission for the planner's cheap
++// model: reports whether the given demote page-counts (main and backend) fit the Host
++// arena's CURRENT free extents. The byte-total model can be optimistic when free space
++// is fragmented; this is the allocator's real answer (releases only add space, so
++// asking without the plan's releases is conservative and safe).
++bool ProgramImplCore::host_kv_requests_fit(std::span<const std::uint32_t> main_pages,
++                                           std::span<const std::uint32_t> back_pages) const {
++    std::vector<HostKVAllocationRequest> requests;
++    requests.reserve(main_pages.size() + back_pages.size());
++    std::vector<HostKVPageLayout> layouts;
++    layouts.reserve(2);
++    if (text_kv_pages) {
++        layouts.push_back(plan_host_kv_page_layout(text_kv_pages->physical_pool().geometry()));
++        for (const std::uint32_t pages : main_pages) {
++            if (pages != 0) { requests.push_back({.layout = &layouts.back(), .pages = pages}); }
++        }
++    }
++    if (backend_kv_pages) {
++        layouts.push_back(plan_host_kv_page_layout(backend_kv_pages->physical_pool().geometry()));
++        for (const std::uint32_t pages : back_pages) {
++            if (pages != 0) { requests.push_back({.layout = &layouts.back(), .pages = pages}); }
++        }
++    }
++    if (requests.empty()) { return true; }
++    if (host_kv_extents == nullptr) { return false; }
++    const std::span<const HostKVPageReplicaRelease> no_releases;
++    return host_kv_extents->can_allocate_after_page_releases(no_releases, requests);
++}
++
+ bool ProgramImplCore::physical_peak_fits(detail::PhysicalResources peak) const noexcept {
+     const detail::PhysicalResources occupied = physical_occupancy();
+     const detail::PhysicalResources limits   = admission_capacity();
