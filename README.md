@@ -88,6 +88,40 @@ Supporting changes:
   expansion machinery are retained in the session API but no longer called by
   the planner (dead code, kept to minimize the patch's surface).
 
+### C=4 finalize survival (2026-09-12): demote→eviction conversion
+
+At `--max-concurrency 4` the pool-overflow machinery runs mid-growth for the
+first time, and the finalize squeeze exposed a host-relief bug:
+
+- Phase 1 demotes the dead sub-continuations to the Host tier (each ~728 MiB),
+  filling it; the finalize then cannot demote enough and needs ~660-680 MiB
+  more Host.
+- Phase 2's host-relief eviction **rejected the demoted subs**: their pages
+  overlap the shared prefix, so `owner_exclusive_resources` counts ~0 exclusive
+  Host for them and the `host.kv_bytes == 0` guard filtered them out. The only
+  victims with exclusive Host were the mains — so the planner evicted a live
+  main (deterministic coin-flip among equivalent mains → 3/4 finalize).
+
+The fix (all in `deterministic_target`, `pressure_planner.h`):
+
+1. **Host pressure = deterministic shortfall.** When the plan does not fit, the
+   residual Host pressure is the demote demand minus the plan's own eviction
+   frees minus the tier's free space — not the full demand. This makes Host
+   pressure continuous so chained small evictions accumulate relief.
+2. **Eviction order = smallest victims first** (KV size ascending, stable within
+   value order) — the large mains are tried last.
+3. **A demoted victim may be evicted** (the "never undo a phase 1 demote" guard
+   is gone): its host copy is exactly the relief the squeeze needs.
+4. **Eviction accepted when it removes a demote's Host demand**
+   (`removes_demote_host`: current decision added Host) even if the eviction
+   frees no exclusive Host. Evicting a demoted sub replaces its demote with an
+   eviction, dropping its whole ~728 MiB Host demand from the plan — two subs
+   close the observed shortfall without touching any main.
+
+Verified: agent-sim 4×150K at C=4 → **4/4 finalize (100% reuse)** on two
+consecutive clean runs; the 18 evictions hit dead subs only, zero mains.
+Retention bench stays **65/65 (108.46%)** on the same build.
+
 ## Build
 
 Apply to a stock ninfer checkout, then build the image (rootful podman in the
@@ -146,7 +180,7 @@ never forces an eviction when dropping a redundant state checkpoint suffices.
 - Deterministic and O(n log n); planning_elapsed stays in the single-digit ms
   range even at 200+ victims.
 
-## Verified results (2026-09-11, clean production build)
+## Verified results
 
 **Both benches pass on the same build, and agent-sim is stable across runs:**
 
@@ -154,11 +188,11 @@ never forces an eviction when dropping a redundant state checkpoint suffices.
   contexts restorable from the RAM tier in reverse order.
 - **agent-sim 4×150K: 4/4 finalizes at ≥98.6% reuse** (`private_turn_closure`),
   mains ~96.5% at every step (the natural 5K-token step growth), **zero
-  `selected_maximal_fallback`**, in 4 consecutive clean runs (46–48 + the
-  clean-build re-verify). The historical 2/4 coin-flip is gone: the finalize
-  of the last session now evicts the already-finalized dead-weight mains
-  (deterministic eviction frees) instead of being blocked by the full Host
-  tier and falling back to a root re-prefill.
+  `selected_maximal_fallback`**.
+- **At `--max-concurrency 4` (2026-09-12): 4/4 finalize (100% reuse)** on two
+  consecutive clean runs — the demote→eviction conversion above makes the
+  planner convert the dead subs' demotes into evictions instead of evicting a
+  live main. Retention bench re-verified 65/65 on the same build.
 
 ## Verify
 
